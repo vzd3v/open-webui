@@ -8,7 +8,7 @@ from open_webui.models.chats import Chats
 from open_webui.models.config import Config
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.json_codec import JSONCodec
-from open_webui.utils.misc import get_content_from_message, get_last_user_message, get_message_list
+from open_webui.utils.misc import get_last_user_message, get_message_list
 from open_webui.utils.payload import apply_params_to_form_data
 from open_webui.utils.task import (
     prompt_template,
@@ -37,6 +37,13 @@ Summarize the conversation history that will be compacted out of the active chat
 
 ### Recent Messages Kept In Context:
 {{RECENT_MESSAGES}}"""
+
+CONTEXT_SUMMARY_START = '<openwebui_context_summary>'
+CONTEXT_SUMMARY_END = '</openwebui_context_summary>'
+CONTEXT_SUMMARY_OUTPUT_INSTRUCTION = (
+    f'End your response with {CONTEXT_SUMMARY_END}. Begin your response with {CONTEXT_SUMMARY_START}.\n'
+    'Place only the final summary between these markers. Do not call tools or include analysis.'
+)
 
 
 async def compact_messages_for_request(
@@ -362,6 +369,7 @@ async def _generate_summary(
     prompt = replace_messages_variable(prompt, recent_messages, 'RECENT_MESSAGES')
     prompt = prompt_variables_template(prompt, {'{{PREVIOUS_SUMMARY}}': previous_summary or ''})
     prompt = await prompt_template(prompt, user)
+    prompt = f'{prompt.rstrip()}\n\n{CONTEXT_SUMMARY_OUTPUT_INSTRUCTION}'
 
     task_model_params = task_config.get('task.model.params') or {}
     if not isinstance(task_model_params, dict):
@@ -382,43 +390,135 @@ async def _generate_summary(
     }
 
     payload = apply_params_to_form_data(payload, models[task_model_id], task_model_params)
-    response = await generate_chat_completion(request, form_data=payload, user=user)
-    summary = _response_text(response).strip()
-    if summary:
-        return summary
-
-    parts = [previous_summary] if previous_summary else []
-    for message in compacted_messages:
-        content = get_content_from_message(message)
-        if content:
-            parts.append(f'- {message.get("role", "unknown")}: {content[:500]}')
-    return '\n'.join(parts)[:4000]
+    _remove_incompatible_task_params(payload)
+    response = await generate_chat_completion(
+        request,
+        form_data=payload,
+        user=user,
+        bypass_model_params=True,
+        bypass_system_prompt=True,
+    )
+    summary = _extract_summary(_response_text(response))
+    if not summary:
+        raise ValueError('Context compaction returned no valid summary')
+    return summary
 
 
 def _response_text(response: Any) -> str:
+    response = _response_dict(response)
+    if not response:
+        return ''
+
+    if response.get('choices'):
+        return _chat_completion_text(response)
+    return _responses_text(response)
+
+
+def _response_dict(response: Any) -> dict:
     if isinstance(response, list) and len(response) == 1:
         response = response[0]
 
     if isinstance(response, JSONResponse):
+        if response.status_code >= 400:
+            return {}
         try:
             response = JSONCodec.loads(response.body.decode('utf-8', 'replace'))
         except Exception:
-            return ''
+            return {}
 
-    if not isinstance(response, dict):
+    return response if isinstance(response, dict) else {}
+
+
+def _chat_completion_text(response: dict) -> str:
+    choices = response.get('choices')
+    if not isinstance(choices, list) or len(choices) != 1:
         return ''
 
-    choices = response.get('choices') or []
-    if choices:
-        message = choices[0].get('message') or {}
-        return message.get('content') or message.get('reasoning_content') or ''
+    choice = choices[0]
+    if not isinstance(choice, dict) or choice.get('finish_reason') not in {None, 'stop'}:
+        return ''
+
+    message = choice.get('message') or {}
+    if (
+        not isinstance(message, dict)
+        or message.get('role') not in {None, 'assistant'}
+        or message.get('tool_calls')
+        or message.get('function_call')
+    ):
+        return ''
+
+    content = message.get('content')
+    return content if isinstance(content, str) else ''
+
+
+def _responses_text(response: dict) -> str:
+    if response.get('status') not in {None, 'completed'}:
+        return ''
 
     parts = []
     for item in response.get('output') or []:
-        for content in item.get('content') or []:
-            if isinstance(content, dict):
-                parts.append(content.get('text') or content.get('content') or '')
-    return '\n'.join(part for part in parts if part)
+        text = _responses_output_item_text(item)
+        if text is None:
+            return ''
+        if text:
+            parts.append(text)
+    return '\n'.join(parts)
+
+
+def _responses_output_item_text(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return None
+
+    item_type = item.get('type')
+    if item.get('tool_calls') or item.get('function_call'):
+        return None
+    if item_type in {'reasoning', 'compaction'}:
+        return ''
+    if item_type != 'message':
+        return None
+    if item.get('role') != 'assistant':
+        return None
+
+    parts = []
+    for content in item.get('content') or []:
+        if not isinstance(content, dict) or content.get('type') not in {'text', 'output_text'}:
+            return None
+        text = content.get('text') or content.get('content')
+        if not isinstance(text, str):
+            return None
+        parts.append(text)
+    return '\n'.join(parts)
+
+
+def _remove_incompatible_task_params(payload: dict) -> None:
+    incompatible_keys = (
+        'format',
+        'function_call',
+        'functions',
+        'parallel_tool_calls',
+        'response_format',
+        'tool_choice',
+        'tools',
+    )
+    for key in incompatible_keys:
+        payload.pop(key, None)
+
+    options = payload.get('options')
+    if isinstance(options, dict):
+        for key in incompatible_keys:
+            options.pop(key, None)
+
+
+def _extract_summary(text: str) -> str:
+    if text.count(CONTEXT_SUMMARY_START) != 1 or text.count(CONTEXT_SUMMARY_END) != 1:
+        return ''
+
+    start = text.find(CONTEXT_SUMMARY_START) + len(CONTEXT_SUMMARY_START)
+    end = text.find(CONTEXT_SUMMARY_END, start)
+    if end < start:
+        return ''
+    summary = text[start:end].strip()
+    return '' if summary in {'...', '…'} else summary
 
 
 def _estimate_messages_tokens(messages: list[dict]) -> int:

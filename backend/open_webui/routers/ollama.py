@@ -1105,13 +1105,12 @@ async def generate_chat_completion(
     # This prevents holding a connection during the entire LLM call (30-60+ seconds),
     # which would exhaust the connection pool under concurrent load.
 
-    # bypass_filter and bypass_system_prompt are read from request.state to prevent
-    # external clients from setting them via query parameter. Only internal
-    # server-side callers (e.g. utils/chat.py) should set
-    # request.state.bypass_filter / request.state.bypass_system_prompt = True.
+    # Internal bypass flags are read from request.state so external clients
+    # cannot set them through query parameters.
     bypass_filter = getattr(request.state, 'bypass_filter', False)
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
+    bypass_model_params = getattr(request.state, 'bypass_model_params', False)
     bypass_system_prompt = getattr(request.state, 'bypass_system_prompt', False)
 
     metadata = form_data.pop('metadata', None)
@@ -1137,7 +1136,8 @@ async def generate_chat_completion(
         params = model_info.params.model_dump()
         if params:
             system = params.pop('system', None)
-            payload = apply_model_params_to_body_ollama(params, payload)
+            if not bypass_model_params:
+                payload = apply_model_params_to_body_ollama(params, payload)
             if not bypass_system_prompt:
                 payload = await apply_system_prompt_to_body(system, payload, metadata, user)
 
